@@ -325,6 +325,8 @@ class StudentCSVRecord(BaseModel):
     degree_id: str
     branch_id: str
     year: int
+    role: str = "student"
+    password: Optional[str] = None
 
 
 class ReminderCreate(BaseModel):

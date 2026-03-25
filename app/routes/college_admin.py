@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 import csv
 import io
+import re
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
@@ -22,7 +23,63 @@ from app.utils.dependencies import ensure_single_cr_per_class, get_college_admin
 
 router = APIRouter(prefix="/college-admin", tags=["college-admin"])
 
-REQUIRED_CSV_COLUMNS = ["name", "student_id", "email", "degree_id", "branch_id", "year"]
+REQUIRED_CSV_COLUMNS = ["name", "student_id", "email", "year"]
+DEGREE_COLUMN_CANDIDATES = ["degree_id", "degree_code", "degree_name", "degree"]
+BRANCH_COLUMN_CANDIDATES = ["branch_id", "branch_code", "branch_name", "branch"]
+
+
+def normalize_csv_row(row: dict) -> dict:
+    return {(key or "").strip().lower(): (value or "").strip() for key, value in row.items()}
+
+
+def first_present_value(row: dict, keys: list[str]) -> str | None:
+    for key in keys:
+        value = row.get(key)
+        if value:
+            return value
+    return None
+
+
+async def resolve_degree(db, college_id: str, raw_value: str):
+    if not raw_value:
+        raise HTTPException(status_code=400, detail="Degree value is required")
+
+    escaped_value = re.escape(raw_value)
+    degree = None
+    if ObjectId.is_valid(raw_value):
+        degree = await db.degrees.find_one({"_id": ObjectId(raw_value), "college_id": college_id})
+
+    if not degree:
+        degree = await db.degrees.find_one({"college_id": college_id, "code": {"$regex": f"^{escaped_value}$", "$options": "i"}})
+
+    if not degree:
+        degree = await db.degrees.find_one({"college_id": college_id, "name": {"$regex": f"^{escaped_value}$", "$options": "i"}})
+
+    if not degree:
+        raise HTTPException(status_code=404, detail=f"Degree '{raw_value}' not found in this college")
+
+    return degree
+
+
+async def resolve_branch(db, degree_id: str, raw_value: str):
+    if not raw_value:
+        raise HTTPException(status_code=400, detail="Branch value is required")
+
+    escaped_value = re.escape(raw_value)
+    branch = None
+    if ObjectId.is_valid(raw_value):
+        branch = await db.branches.find_one({"_id": ObjectId(raw_value), "degree_id": degree_id})
+
+    if not branch:
+        branch = await db.branches.find_one({"degree_id": degree_id, "code": {"$regex": f"^{escaped_value}$", "$options": "i"}})
+
+    if not branch:
+        branch = await db.branches.find_one({"degree_id": degree_id, "name": {"$regex": f"^{escaped_value}$", "$options": "i"}})
+
+    if not branch:
+        raise HTTPException(status_code=404, detail=f"Branch '{raw_value}' not found for the selected degree")
+
+    return branch
 
 
 async def serialize_user(user: dict, db) -> UserResponse:
@@ -92,9 +149,13 @@ async def get_college_students(current_user: dict = Depends(get_college_admin)):
         {"college_id": current_user.get("college_id"), "role": {"$in": ["student", "cr"]}}
     ).sort([("year", 1), ("student_id", 1)]).to_list(None)
 
+    class_ids = [ObjectId(user["class_id"]) for user in users if user.get("class_id") and ObjectId.is_valid(user["class_id"])]
+    class_docs = await db.classes.find({"_id": {"$in": class_ids}}).to_list(None) if class_ids else []
+    class_map = {str(class_doc["_id"]): class_doc for class_doc in class_docs}
+
     grouped = {}
     for user in users:
-        class_doc = await db.classes.find_one({"_id": ObjectId(user["class_id"])}) if user.get("class_id") else None
+        class_doc = class_map.get(user.get("class_id")) if user.get("class_id") else None
         class_key = class_doc.get("code") if class_doc else "Unassigned"
         grouped.setdefault(
             class_key,
@@ -102,12 +163,15 @@ async def get_college_students(current_user: dict = Depends(get_college_admin)):
                 "class_id": str(class_doc["_id"]) if class_doc else None,
                 "class_code": class_key,
                 "class_name": class_doc.get("name") if class_doc else "Unassigned",
+                "year": class_doc.get("year") if class_doc else None,
                 "students": [],
             },
         )
         grouped[class_key]["students"].append((await serialize_user(user, db)).model_dump())
 
-    return list(grouped.values())
+    grouped_list = list(grouped.values())
+    grouped_list.sort(key=lambda item: ((item.get("year") or 999), item["class_code"]))
+    return grouped_list
 
 
 @router.post("/students", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
@@ -216,28 +280,63 @@ async def import_students_csv(file: UploadFile = File(...), current_user: dict =
     except Exception:
         raise HTTPException(status_code=400, detail="Unable to read CSV file")
 
-    if not csv_reader.fieldnames or any(column not in csv_reader.fieldnames for column in REQUIRED_CSV_COLUMNS):
+    normalized_fieldnames = [(field or "").strip().lower() for field in (csv_reader.fieldnames or [])]
+    has_degree_column = any(column in normalized_fieldnames for column in DEGREE_COLUMN_CANDIDATES)
+    has_branch_column = any(column in normalized_fieldnames for column in BRANCH_COLUMN_CANDIDATES)
+
+    if (
+        not csv_reader.fieldnames
+        or any(column not in normalized_fieldnames for column in REQUIRED_CSV_COLUMNS)
+        or not has_degree_column
+        or not has_branch_column
+    ):
         raise HTTPException(
             status_code=400,
-            detail=f"CSV format is invalid. Required columns: {', '.join(REQUIRED_CSV_COLUMNS)}",
+            detail=(
+                "CSV format is invalid. Required columns: "
+                "name, student_id, email, year, plus one degree column "
+                "(degree/degree_code/degree_name/degree_id) and one branch column "
+                "(branch/branch_code/branch_name/branch_id)"
+            ),
         )
 
     imported = 0
     errors = []
     total_rows = 0
+    seen_emails = set()
+    seen_student_ids = set()
 
     for total_rows, row in enumerate(csv_reader, start=2):
         try:
+            normalized_row = normalize_csv_row(row)
+            degree_value = first_present_value(normalized_row, DEGREE_COLUMN_CANDIDATES)
+            branch_value = first_present_value(normalized_row, BRANCH_COLUMN_CANDIDATES)
+            role = (normalized_row.get("role") or "student").strip().lower()
+            if role not in {"student", "cr"}:
+                raise ValueError("role must be either 'student' or 'cr'")
+
+            degree = await resolve_degree(db, current_user.get("college_id"), degree_value)
+            branch = await resolve_branch(db, str(degree["_id"]), branch_value)
+
             record = StudentCSVRecord(
-                name=row["name"],
-                student_id=row["student_id"],
-                email=row["email"],
-                degree_id=row["degree_id"],
-                branch_id=row["branch_id"],
-                year=int(row["year"]),
+                name=normalized_row["name"],
+                student_id=normalized_row["student_id"],
+                email=normalized_row["email"],
+                degree_id=str(degree["_id"]),
+                branch_id=str(branch["_id"]),
+                year=int(normalized_row["year"]),
+                role=role,
+                password=normalized_row.get("password") or normalized_row["student_id"],
             )
+
+            email_key = record.email.lower()
+            student_id_key = record.student_id.lower()
+            if email_key in seen_emails or student_id_key in seen_student_ids:
+                errors.append(f"Row {total_rows}: duplicate student email or ID within CSV")
+                continue
+
             if await db.users.find_one({"$or": [{"email": record.email}, {"student_id": record.student_id}]}):
-                errors.append(f"Row {total_rows}: duplicate student email or ID")
+                errors.append(f"Row {total_rows}: duplicate student email or ID in database")
                 continue
 
             class_doc = await ensure_class_for_combination(
@@ -248,13 +347,16 @@ async def import_students_csv(file: UploadFile = File(...), current_user: dict =
                 record.year,
             )
 
+            if record.role == "cr":
+                await ensure_single_cr_per_class(current_user.get("college_id"), str(class_doc["_id"]), db)
+
             await db.users.insert_one(
                 {
                     "name": record.name,
                     "student_id": record.student_id,
                     "email": record.email,
-                    "password_hash": hash_password("TempPassword123"),
-                    "role": "student",
+                    "password_hash": hash_password(record.password),
+                    "role": record.role,
                     "college_id": current_user.get("college_id"),
                     "degree_id": record.degree_id,
                     "branch_id": record.branch_id,
@@ -263,6 +365,8 @@ async def import_students_csv(file: UploadFile = File(...), current_user: dict =
                     "created_at": datetime.now(timezone.utc),
                 }
             )
+            seen_emails.add(email_key)
+            seen_student_ids.add(student_id_key)
             imported += 1
         except Exception as exc:
             errors.append(f"Row {total_rows}: {exc}")
@@ -277,23 +381,35 @@ async def export_students_csv(current_user: dict = Depends(get_college_admin)):
         {"college_id": current_user.get("college_id"), "role": {"$in": ["student", "cr"]}}
     ).sort("student_id", 1).to_list(None)
 
+    degrees = await db.degrees.find({"college_id": current_user.get("college_id")}).to_list(None)
+    degree_map = {str(degree["_id"]): degree for degree in degrees}
+    branches = await db.branches.find({"degree_id": {"$in": list(degree_map.keys())}}).to_list(None) if degree_map else []
+    branch_map = {str(branch["_id"]): branch for branch in branches}
+    class_ids = [ObjectId(student["class_id"]) for student in students if student.get("class_id") and ObjectId.is_valid(student["class_id"])]
+    class_docs = await db.classes.find({"_id": {"$in": class_ids}}).to_list(None) if class_ids else []
+    class_map = {str(class_doc["_id"]): class_doc for class_doc in class_docs}
+
     output = io.StringIO()
     writer = csv.DictWriter(
         output,
-        fieldnames=["name", "student_id", "email", "degree_id", "branch_id", "year", "class_id", "role"],
+        fieldnames=["name", "student_id", "email", "degree", "branch", "year", "class_code", "role", "password"],
     )
     writer.writeheader()
     for student in students:
+        degree = degree_map.get(student.get("degree_id"))
+        branch = branch_map.get(student.get("branch_id"))
+        class_doc = class_map.get(student.get("class_id"))
         writer.writerow(
             {
                 "name": student["name"],
                 "student_id": student.get("student_id", ""),
                 "email": student["email"],
-                "degree_id": student.get("degree_id", ""),
-                "branch_id": student.get("branch_id", ""),
+                "degree": degree.get("code") if degree else "",
+                "branch": branch.get("code") if branch else "",
                 "year": student.get("year", ""),
-                "class_id": student.get("class_id", ""),
+                "class_code": class_doc.get("code") if class_doc else "",
                 "role": student.get("role", "student"),
+                "password": "",
             }
         )
     return {"content": output.getvalue(), "filename": "students.csv"}
